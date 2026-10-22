@@ -110,6 +110,12 @@ for source installation and verification.
 For local development, API lifecycle guidance, validation, integration, and
 KVCR guard service usage, see the [developer guide](docs/dev-guide.md).
 
+### Single DRAM tier (experimental)
+
+[Single DRAM tier](docs/single-dram-tier.md) covers running vLLM's host offload
+tier directly in the KVCR guard service pool, which removes the second DRAM copy.
+It describes the design, the vLLM patch, and the B200 validation plan.
+
 ## License
 
 KVCR is released under the Apache License 2.0. The full license text is in

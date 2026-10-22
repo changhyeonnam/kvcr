@@ -379,6 +379,37 @@ Service shutdown closes and removes its pool files. Startup reclaims files
 orphaned by a crashed service; file locks protect pools still used by a live
 service or attached worker.
 
+#### Framework-managed slots
+
+With `KVCRConfig.framework_managed_slots`, the framework places blocks in the
+local DRAM slots itself, for example when the pool is also its own host tier.
+KVCR keeps the residency records, journal, inventory, peer serving and G3, but
+it never allocates or evicts a slot there: a `deposit` or `fetch` that would
+need a new slot fails.
+
+- `local_dram_pools()` gives each pool's name, address and size.
+- `local_dram_residency()` gives every readable block and its slots. Right after
+  a Guard claim, these are the blocks the pool kept for this primary.
+- `commit_framework_slots({key: [(label, slot), ...]})` records blocks whose
+  bytes are complete and journals them. A batch with an out-of-range or
+  occupied slot, or a key already in local DRAM, records nothing.
+- `try_retire_framework_slots(keys)` returns `{key: bool}`. True means the
+  removal is journaled and the slots may be overwritten. False means KVCR still
+  reads the block or the policy keeps it; pick another victim and leave its
+  slots alone.
+
+A retire is where KVCR would otherwise evict, so it asks the policy then. With
+G3 and the default `G3LRUPolicy`, the first retire starts the spill from the
+slot in place and returns False; once the write lands, the next retire returns
+True and the block stays on G3. A failed spill follows the policy's
+`decide_recovery`, and the next retire then returns True. A block already on G3
+retires at once.
+
+Commit only after the bytes are written, and overwrite only after a retire
+returns True. Following both rules keeps a recovered pool from naming a slot
+whose bytes belong to another block. The journal records are the same as for
+KVCR-placed slots, so the Guard mirrors, serves and hands them back unchanged.
+
 Run the focused service tests after changing this subsystem:
 
 ```bash
@@ -575,6 +606,22 @@ one pool size, for example `--pool-sizes-gb 48`.
 Do not enable all capacity mechanisms blindly: a pool owned by the guard service takes
 precedence over an in-process `secondary_g2_slots` allocation. Policy names and
 diagnostic options must match the KVCR and vLLM revisions being tested.
+
+`single_dram_tier: true` on the KVCR tier makes vLLM's primary host tier live in
+the guard service pool, so host DRAM holds each block once: stores go
+HBM → pool → G3 with no DRAM-to-DRAM deposit. vLLM still places, evicts and
+copies chunks; KVCR records each stored chunk with `commit_framework_slots` and
+approves every reuse through `try_retire_framework_slots`, spilling to G3 first
+under the default policy. After a worker restart, vLLM gets the pool's surviving
+chunks back as cache hits. It requires:
+
+- `kvcr_service_socket_path` and `compatibility_digest`, and no
+  `secondary_g2_slots`;
+- tensor and pipeline parallel size 1, so the worker and scheduler share one claim;
+- a pool of at least `cpu_bytes_to_use`, rounded down to whole chunks; and
+- a `compatibility_digest` that changes with `cpu_bytes_to_use` and the KV layout.
+
+vLLM's own `/dev/shm/vllm_offload_*` region is not created in this mode.
 
 The worker configuration enables its side of the contract. Dynamo must still run a
 KV-aware router that consumes KV events, selects a source and destination, and

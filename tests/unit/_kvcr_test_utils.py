@@ -599,6 +599,7 @@ def _new_local_kvcr(
     local_dram_backend="UCX",
     framework_regions: list[RegionDescriptor] | None = None,
     on_resilience_event=None,
+    framework_managed_slots=False,
 ) -> KVCR:
     pinning = FakePrimaryPinning()
     with _use_nixl_agent(agent):
@@ -608,6 +609,7 @@ def _new_local_kvcr(
                 pool_layouts=[("", len(local) // slot_count)],
                 nixl_listen_port=1,
                 capacity_low_watermark_percent=capacity_low_watermark_percent,
+                framework_managed_slots=framework_managed_slots,
             ),
             KVCRBindings(
                 pinning.request_pin,

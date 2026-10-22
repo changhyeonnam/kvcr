@@ -195,6 +195,41 @@ class KVCR:
         """Release block residency claims."""
         return self._core.release(handles)
 
+    def local_dram_pools(self) -> list[tuple[str, int, int]]:
+        """Each local DRAM pool's name, address and size in bytes.
+
+        With a Guard, these are the service-owned pools this process claimed.
+        """
+        return self._core.local_dram_pools()
+
+    def local_dram_residency(self) -> dict[BlockKey, list[tuple[str, int]]]:
+        """Every readable local DRAM block and its (pool label, slot) locations.
+
+        Right after construction with a Guard, this is what the pool still held
+        from the previous primary.
+        """
+        return self._core.local_dram_residency()
+
+    def commit_framework_slots(
+        self, blocks: Mapping[BlockKey, Collection[tuple[str, int]]]
+    ) -> None:
+        """Record blocks the framework finished writing into its own slots.
+
+        Only with ``framework_managed_slots``. Call once the bytes are complete:
+        each block is journaled for recovery as soon as it is recorded.
+        """
+        self._core.commit_framework_slots(blocks)
+
+    def try_retire_framework_slots(
+        self, keys: Collection[BlockKey]
+    ) -> dict[BlockKey, bool]:
+        """Remove framework-placed blocks whose slots nothing in KVCR still reads.
+
+        Only with ``framework_managed_slots``. Overwrite a block's slots only
+        after it comes back True; False means a transfer still reads them.
+        """
+        return self._core.try_retire_framework_slots(keys)
+
     def poll_completed(self) -> Iterable[OpResult]:
         """Drain completed operation results."""
         return self._core.poll_completed()

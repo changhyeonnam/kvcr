@@ -4,6 +4,8 @@
 import ctypes
 import logging
 import os
+import time
+from unittest.mock import Mock
 
 import pytest
 from _kvcr_test_utils import (
@@ -40,7 +42,11 @@ from kvcr.core import _BlockRecord
 from kvcr.local_disk import _G3Residency
 from kvcr.local_dram import _LocalDramState
 from kvcr.policy import FIFOPolicy, G3FIFOPolicy, G3LRUPolicy
-from kvcr.recovery_journal import install_recovery_records
+from kvcr.recovery_journal import (
+    _attach_journal,
+    _RecoveryMirror,
+    install_recovery_records,
+)
 from kvcr.types import (
     BlockKey,
     CacheTier,
@@ -168,6 +174,7 @@ def _new_g3_kvcr(
     g3_paths=None,
     framework_regions=None,
     on_resilience_event=None,
+    framework_managed_slots=False,
 ):
     page_size = os.sysconf("SC_PAGE_SIZE")
     return _new_kvcr(
@@ -178,6 +185,7 @@ def _new_g3_kvcr(
             nixl_agent_name="target",
             pool_layouts=[("", len(local) // slot_count)],
             enable_telemetry=telemetry,
+            framework_managed_slots=framework_managed_slots,
         ),
         local_dram=LocalDramOptions([("", ctypes.addressof(local), len(local))]),
         g3=G3Options(
@@ -1136,3 +1144,153 @@ def test_waiting_g3_fetch_obeys_original_deadline(tmp_path) -> None:
     _poll_until(kvcr, lambda _: not _has_outstanding_operations(kvcr))
     assert kvcr.query((first,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
     assert kvcr.query((second,)) == [(QueryStatus.MISS, None)]
+
+
+def _settle(kvcr, predicate) -> None:
+    """Drive completions until a spill this test started has landed."""
+    deadline = time.monotonic() + 2
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError("G3 spill did not settle")
+        list(kvcr.poll_completed())
+        time.sleep(0.001)
+
+
+def _framework_g3_kvcr(tmp_path, local, destination, **kwargs):
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    return _new_g3_kvcr(
+        tmp_path,
+        local,
+        slot_count=2,
+        framework_regions=[_buffer_region(destination, page_size)],
+        framework_managed_slots=True,
+        **kwargs,
+    )
+
+
+def test_framework_slot_spills_in_place_before_the_framework_retires_it(
+    tmp_path,
+) -> None:
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    local = ctypes.create_string_buffer(page_size * 2)
+    destination = ctypes.create_string_buffer(page_size)
+    events: list[InventoryEvent] = []
+    agent = _FakeG3Agent()
+    kvcr = _framework_g3_kvcr(
+        tmp_path, local, destination, agent=agent, inventory_sink=events.append
+    )
+    journal = Mock()
+    journal.publish.return_value = True
+    _attach_journal(kvcr._core._local_dram, journal, kvcr._core._g3)
+    key = BlockKey(b"k0")
+    local[page_size : 2 * page_size] = b"s" * page_size
+    kvcr.commit_framework_slots({key: [("", 1)]})
+
+    # The default policy spills on eviction; the slot stays named until it lands.
+    assert kvcr.try_retire_framework_slots([key]) == {key: False}
+    _settle(kvcr, lambda: kvcr._core._block_record_map[key].g3 is not None)
+    assert kvcr.local_dram_residency() == {key: [("", 1)]}
+    assert kvcr.try_retire_framework_slots([key]) == {key: True}
+
+    assert kvcr.local_dram_residency() == {}
+    assert kvcr.query((key,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]
+    assert events == [
+        InventoryEvent((key,), CacheTier.LOCAL_G2, False),
+        InventoryEvent((key,), CacheTier.G3, False),
+        InventoryEvent((key,), CacheTier.LOCAL_G2, True),
+    ]
+    mirror = _RecoveryMirror(("",))
+    for call in journal.publish.call_args_list:
+        mirror.apply(*call.args)
+    (recovered,) = mirror.take_records().values()
+    assert recovered.local_dram is None and recovered.g3 is not None
+
+    # The framework reuses the slot; the SSD copy is unaffected.
+    local[page_size : 2 * page_size] = b"x" * page_size
+    deliver = kvcr.deliver({key: [_mem_descriptor()]})
+    assert dict(_poll_until(kvcr, bool))[deliver][key].success
+    assert destination.raw == b"s" * page_size
+
+    # Promoted back into a slot, it is already on SSD and retires at once.
+    writes = len(agent.transfers)
+    kvcr.commit_framework_slots({key: [("", 0)]})
+    assert kvcr.try_retire_framework_slots([key]) == {key: True}
+    assert len(agent.transfers) == writes
+
+
+def test_a_failed_framework_spill_drops_the_block_on_the_next_retire(
+    tmp_path,
+) -> None:
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    local = ctypes.create_string_buffer(page_size * 2)
+    destination = ctypes.create_string_buffer(page_size)
+    policy = _MoveLocalToG3Policy()
+    kvcr = _framework_g3_kvcr(
+        tmp_path,
+        local,
+        destination,
+        agent=_FakeG3Agent(fail_file_writes=True),
+        policy=policy,
+    )
+    key = BlockKey(b"k0")
+    kvcr.commit_framework_slots({key: [("", 0)]})
+
+    assert kvcr.try_retire_framework_slots([key]) == {key: False}
+    _settle(kvcr, lambda: bool(policy.failures))
+    assert kvcr.try_retire_framework_slots([key]) == {key: True}
+
+    assert [failure.reason for _, failure in policy.failures] == ["transfer failed"]
+    assert kvcr.query((key,)) == [(QueryStatus.MISS, None)]
+
+
+@pytest.mark.parametrize(
+    ("action", "retired"),
+    [(PlacementAction.DROP, True), (PlacementAction.KEEP, False)],
+)
+def test_framework_retire_follows_a_policy_that_does_not_spill(
+    tmp_path, action: PlacementAction, retired: bool
+) -> None:
+    class _Policy(FIFOPolicy):
+        def decide_eviction(self, meta, source):
+            return (action, None)
+
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    local = ctypes.create_string_buffer(page_size * 2)
+    destination = ctypes.create_string_buffer(page_size)
+    agent = _FakeG3Agent()
+    kvcr = _framework_g3_kvcr(
+        tmp_path, local, destination, agent=agent, policy=_Policy()
+    )
+    key = BlockKey(b"k0")
+    kvcr.commit_framework_slots({key: [("", 0)]})
+
+    assert kvcr.try_retire_framework_slots([key]) == {key: retired}
+    if not retired:
+        # Kept, not pending: asking again keeps it again.
+        assert kvcr.try_retire_framework_slots([key]) == {key: False}
+    assert agent.transfers == []
+    assert kvcr.local_dram_residency() == ({} if retired else {key: [("", 0)]})
+
+
+def test_framework_slots_recover_with_their_g3_copies(tmp_path) -> None:
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    local = ctypes.create_string_buffer(page_size * 2)
+    destination = ctypes.create_string_buffer(page_size)
+    kvcr = _framework_g3_kvcr(tmp_path, local, destination)
+    both, disk_only = BlockKey(b"both"), BlockKey(b"disk-only")
+    install_recovery_records(
+        kvcr._core,
+        {
+            both: _recovered_record(g2=[("", 1)], g3=0),
+            disk_only: _recovered_record(g3=1),
+        },
+    )
+
+    assert kvcr.local_dram_residency() == {both: [("", 1)]}
+    assert kvcr.query((both, disk_only)) == [
+        (QueryStatus.HIT, CacheTier.LOCAL_G2),
+        (QueryStatus.FETCHABLE, CacheTier.G3),
+    ]
+    # Already on disk, so the framework gets the slot back without a spill.
+    assert kvcr.try_retire_framework_slots([both]) == {both: True}
+    assert kvcr.query((both,)) == [(QueryStatus.FETCHABLE, CacheTier.G3)]

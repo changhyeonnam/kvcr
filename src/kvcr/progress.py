@@ -659,11 +659,18 @@ class _KVCRProgress:
     def _register_memory_regions(self) -> None:
         if self._nixl_agent is None or not any(self._memory_regions):
             return
+        registered: set[tuple[int, int, int, str]] = set()
         for region in chain.from_iterable(
             regions.values() for regions in self._memory_regions
         ):
             # Assume the entire extent, including stride gaps, is valid to register.
             extent = region.size + (region.count - 1) * (region.stride or region.size)
+            # A framework that addresses a KVCR pool as its own names the same
+            # extent twice; one registration serves both.
+            identity = (region.addr, extent, region.device_Id, region.mem_type)
+            if identity in registered:
+                continue
+            registered.add(identity)
             self._memory_registrations.append(
                 self._nixl_agent.register_memory(
                     [(region.addr, extent, region.device_Id, "")],

@@ -126,6 +126,9 @@ class KVCRConfig(msgspec.Struct, frozen=True):
     capacity_low_watermark_percent: float = 0
     nixl_listen_port: int | None = None
     startup_timeout_seconds: int | None = None
+    # The framework places blocks in local DRAM slots itself and reports them
+    # through commit_framework_slots; KVCR never allocates or evicts there.
+    framework_managed_slots: bool = False
 
 
 class KVCRGuardConfig(msgspec.Struct, frozen=True):

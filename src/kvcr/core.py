@@ -245,6 +245,8 @@ class _KVCRCore:
         # Common KVCR state tables.
         if g3_config is not None and local_dram_config is None:
             raise ValueError("G3 requires configured local DRAM")
+        if self.config.framework_managed_slots and local_dram_config is None:
+            raise ValueError("framework_managed_slots requires local DRAM")
         # Serialize caller metadata transactions with progress-side source claims.
         self._state_lock = threading.RLock()
         self._block_record_map: dict[BlockKey, _BlockRecord] = {}
@@ -330,6 +332,11 @@ class _KVCRCore:
             if self._local_dram is not None
             else {}
         )
+        if self.config.framework_managed_slots and not framework_regions:
+            # The pool is the framework's own memory too: it addresses its slots
+            # as framework elements, often before it can know where a claimed
+            # pool was mapped.
+            framework_regions = dict(kvcr_regions)
         self._memory_regions = (framework_regions, kvcr_regions)
         _validate_memory_regions([*framework_regions.values(), *kvcr_regions.values()])
         dram_backends: set[str] = set()
@@ -734,6 +741,33 @@ class _KVCRCore:
             return [(handle, False) for handle in handles]
         with self._state_lock:
             return self._local_dram.release(handles)
+
+    def local_dram_pools(self) -> list[tuple[str, int, int]]:
+        return self._require_local_dram().pools
+
+    def local_dram_residency(self) -> dict[BlockKey, list[tuple[str, int]]]:
+        local_dram = self._require_local_dram()
+        with self._state_lock:
+            return local_dram.residency()
+
+    def commit_framework_slots(
+        self, blocks: Mapping[BlockKey, Collection[tuple[str, int]]]
+    ) -> None:
+        local_dram = self._require_local_dram()
+        with self._state_lock:
+            local_dram.commit_framework_slots(blocks)
+
+    def try_retire_framework_slots(
+        self, keys: Collection[BlockKey]
+    ) -> dict[BlockKey, bool]:
+        local_dram = self._require_local_dram()
+        with self._state_lock:
+            return local_dram.try_retire_framework_slots(keys)
+
+    def _require_local_dram(self) -> _LocalDram:
+        if self._local_dram is None:
+            raise RuntimeError("KVCR has no local DRAM tier")
+        return self._local_dram
 
     # TODO: Expose individual entry completions as they become available.
     def poll_completed(self) -> Iterable[OpResult]:

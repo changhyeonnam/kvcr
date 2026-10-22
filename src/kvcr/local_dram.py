@@ -319,8 +319,14 @@ class _LocalDram:
 
         self._kvcr = kvcr
         self._backend = region.backend
+        # The framework chooses and reuses slots; KVCR only records what it reports,
+        # so nothing here allocates or evicts and the free lists stay empty.
+        self._framework_managed = kvcr.config.framework_managed_slots
         self._pools: dict[str, tuple[int, int, int]] = {}
         self._free_slots: dict[str, deque[int]] = {}
+        self._framework_slots: dict[str, set[int]] = {}
+        # Framework-placed blocks whose eviction spill has finished, either way.
+        self._spill_settled: set[BlockKey] = set()
         for (pool_name, address, length), (_, slot_size) in zip(
             region.pools, kvcr.pool_layouts
         ):
@@ -332,7 +338,10 @@ class _LocalDram:
             if not slot_count:
                 raise ValueError("local DRAM pool must hold at least one block")
             self._pools[pool_name] = (address, length, slot_size)
-            self._free_slots[pool_name] = deque(range(slot_count))
+            self._free_slots[pool_name] = (
+                deque() if self._framework_managed else deque(range(slot_count))
+            )
+            self._framework_slots[pool_name] = set()
         ranges = sorted(
             (address, address + length) for address, length, _ in self._pools.values()
         )
@@ -414,6 +423,9 @@ class _LocalDram:
             # Byte counts depend on the receiving core's pool geometry.
             residency._cached_size = None
             residency.prepare_label_index()
+        if self._framework_managed:
+            self._framework_slots = occupied
+            return
         self._free_slots = {
             pool_name: deque(
                 slot
@@ -439,13 +451,169 @@ class _LocalDram:
         total_slots = sum(
             length // slot_size for _, length, slot_size in self._pools.values()
         )
-        free_slots = sum(map(len, self._free_slots.values()))
+        free_slots = (
+            total_slots - sum(map(len, self._framework_slots.values()))
+            if self._framework_managed
+            else sum(map(len, self._free_slots.values()))
+        )
         return {
             "local_g2_total_slots": total_slots,
             "local_g2_free_slots": free_slots,
             "local_g2_allocated_slots": total_slots - free_slots,
             "local_g2_evictable_slots": sum(self._evictable_slots.values()),
         }
+
+    @property
+    def pools(self) -> list[tuple[str, int, int]]:
+        """Each pool's name, address and size in bytes."""
+        return [
+            (name, address, length)
+            for name, (address, length, _) in self._pools.items()
+        ]
+
+    def residency(self) -> dict[BlockKey, list[tuple[str, int]]]:
+        """Every readable block and the slots holding it."""
+        return {
+            key: list(record.local_dram.slots)
+            for key, record in self._kvcr._block_record_map.items()
+            if record.local_dram is not None
+            and record.local_dram.state is _LocalDramState.READY
+            and not record.local_dram.pending_labels
+        }
+
+    def commit_framework_slots(
+        self, blocks: Mapping[BlockKey, Collection[tuple[str, int]]]
+    ) -> None:
+        """Record blocks the framework has finished writing into slots it placed.
+
+        The batch is checked whole first, so a refused one records nothing. Each
+        block is journaled as it is recorded: the bytes are already there, and a
+        later holder of the pool may serve them.
+        """
+        self._require_framework_managed()
+        reserved = {name: set() for name in self._pools}
+        prepared: list[tuple[BlockKey, list[tuple[str, int]], tuple[str, ...]]] = []
+        for key, locations in blocks.items():
+            slots = list(locations)
+            record = self._kvcr._block_record_map.get(key)
+            if record is not None and record.local_dram is not None:
+                raise ValueError(f"local DRAM already holds {key!r}")
+            if not slots:
+                raise ValueError(f"no local DRAM slots given for {key!r}")
+            declaration = self._kvcr._validate_expected_layout(
+                [label for label, _ in slots]
+            )
+            for label, slot in slots:
+                pool_name = label.partition(":")[0]
+                _, length, slot_size = self._pools[pool_name]
+                if (
+                    type(slot) is not int
+                    or not 0 <= slot < length // slot_size
+                    or slot in self._framework_slots[pool_name]
+                    or slot in reserved[pool_name]
+                ):
+                    raise ValueError(
+                        f"local DRAM slot {pool_name!r}:{slot!r} for {key!r} "
+                        "is out of range or already holds a block"
+                    )
+                reserved[pool_name].add(slot)
+            prepared.append((key, slots, cast(tuple[str, ...], declaration)))
+
+        now = self._kvcr._clock()
+        for key, slots, declaration in prepared:
+            record = self._kvcr._block_record(key)
+            residency = record.local_dram = _LocalDramResidency(
+                slots, _LocalDramState.READY, key_layout=declaration
+            )
+            residency.prepare_label_index()
+            record.last_access = now
+            for label, slot in slots:
+                self._framework_slots[label.partition(":")[0]].add(slot)
+            self._kvcr._on_ingest(
+                self._kvcr._block_meta(key, record, self._size_bytes(residency)),
+                CacheTier.FW_G2,
+            )
+            self._residency_observer(key, record)
+        committed = [key for key, _, _ in prepared]
+        if self._kvcr._key_history_enabled:
+            self._kvcr._log_key_history(
+                "ready", committed, CacheTier.LOCAL_G2, "framework_commit"
+            )
+        self._kvcr._publish_inventory(committed, CacheTier.LOCAL_G2, removed=False)
+
+    def try_retire_framework_slots(
+        self, keys: Collection[BlockKey]
+    ) -> dict[BlockKey, bool]:
+        """Give framework-placed slots back once KVCR is done with them.
+
+        The framework's retire is the moment KVCR would otherwise evict, so the
+        policy decides here: a spill to G3 starts from the slot in place, and the
+        block is retired by a later call once that write has finished.
+
+        True means the removal is journaled and the slots may be overwritten.
+        False means KVCR is still reading the block, for a transfer or a spill,
+        or the policy keeps it; pick another victim and leave its slots alone.
+        """
+        self._require_framework_managed()
+        ordered = tuple(dict.fromkeys(keys))
+        for key in ordered:
+            record = self._kvcr._block_record_map.get(key)
+            if record is None or record.local_dram is None:
+                raise ValueError(f"local DRAM does not hold {key!r}")
+
+        results: dict[BlockKey, bool] = {}
+        retired: list[BlockKey] = []
+        deadline = self._kvcr._operation_deadline()
+        for key in ordered:
+            record = self._kvcr._block_record_map[key]
+            residency = cast(_LocalDramResidency, record.local_dram)
+            if residency.claim_count or residency.state is not _LocalDramState.READY:
+                results[key] = False
+                continue
+            if key not in self._spill_settled:
+                decision, spilling = self._kvcr._decide_eviction(
+                    self._kvcr._block_meta(key, record, self._size_bytes(residency)),
+                    CacheTier.LOCAL_G2,
+                    deadline,
+                )
+                # A spill that could not start settles at once, and then goes
+                # the way the policy's recovery left it.
+                if spilling or (
+                    decision[0] is PlacementAction.KEEP
+                    and key not in self._spill_settled
+                ):
+                    results[key] = False
+                    continue
+            self._spill_settled.discard(key)
+            record.local_dram = None
+            # Journaled before the slots are given back: once this returns, the
+            # framework may overwrite them, and a recovered pool must not still
+            # name this block there.
+            self._residency_observer(key, record)
+            self._free(residency.slots)
+            self._kvcr._on_remove(
+                self._kvcr._block_meta(key, record, self._size_bytes(residency))
+            )
+            self._kvcr._prune_block_record(key)
+            retired.append(key)
+            results[key] = True
+        if self._kvcr._key_history_enabled:
+            self._kvcr._log_key_history(
+                "remove", retired, CacheTier.LOCAL_G2, "framework_retire"
+            )
+        self._kvcr._publish_inventory(retired, CacheTier.LOCAL_G2, removed=True)
+        return results
+
+    def settle_spill(self, keys: Collection[BlockKey]) -> None:
+        """Note framework-placed blocks whose eviction spill finished, either way.
+
+        Their next retire goes through without asking the policy again.
+        """
+        self._spill_settled.update(keys)
+
+    def _require_framework_managed(self) -> None:
+        if not self._framework_managed:
+            raise RuntimeError("local DRAM slots are not framework-managed")
 
     def deposit(
         self,
@@ -1364,6 +1532,10 @@ class _LocalDram:
     def _allocate_slots(
         self, layout: list[str], protected: frozenset[BlockKey], deadline: float
     ) -> tuple[list[tuple[str, int]] | None, list[BlockKey], bool]:
+        if self._framework_managed:
+            # Every slot is the framework's to place: a deposit or fill that
+            # needs a new one has nowhere to go.
+            return None, [], False
         required = Counter(label.partition(":")[0] for label in layout)
         if all(
             len(self._free_slots[name]) >= count for name, count in required.items()
@@ -1445,6 +1617,8 @@ class _LocalDram:
         )
 
     def _make_evictable(self, key: BlockKey) -> None:
+        if self._framework_managed:
+            return
         record = self._kvcr._block_record_map.get(key)
         if record is None:
             raise RuntimeError(f"missing block record for {key!r}")
@@ -1492,7 +1666,11 @@ class _LocalDram:
 
     def _free(self, locations: Collection[tuple[str, int]]) -> None:
         for label, slot in locations:
-            self._free_slots[label.partition(":")[0]].append(slot)
+            pool_name = label.partition(":")[0]
+            if self._framework_managed:
+                self._framework_slots[pool_name].discard(slot)
+            else:
+                self._free_slots[pool_name].append(slot)
 
     def _size_bytes(self, residency: _LocalDramResidency) -> int:
         if residency._cached_size is None:
@@ -1503,7 +1681,7 @@ class _LocalDram:
         return residency._cached_size
 
     def _update_capacity_pressure(self) -> None:
-        if self._kvcr._capacity_needed_callback is None:
+        if self._kvcr._capacity_needed_callback is None or self._framework_managed:
             return
         self._kvcr._update_capacity_pressure(
             {

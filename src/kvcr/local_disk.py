@@ -570,7 +570,12 @@ class _G3:
         local = self._kvcr._local_dram
         if local is None:
             raise RuntimeError("G3 move completed without local DRAM")
-        local.retire_sources(sources)
+        if local._framework_managed:
+            # The framework still names these slots and reuses them only after
+            # retiring the block itself, so the residency stays until then.
+            local.settle_spill(sources)
+        else:
+            local.retire_sources(sources)
         self._kvcr._release_local_dram_sources(op_id)
 
     def _reserve(

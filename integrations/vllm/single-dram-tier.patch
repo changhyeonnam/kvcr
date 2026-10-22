@@ -1,0 +1,1513 @@
+diff --git a/tests/v1/kv_offload/cpu/test_manager_eviction_gate.py b/tests/v1/kv_offload/cpu/test_manager_eviction_gate.py
+new file mode 100644
+index 0000000000..3e03f6ecf4
+--- /dev/null
++++ b/tests/v1/kv_offload/cpu/test_manager_eviction_gate.py
+@@ -0,0 +1,207 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPUOffloadingManager with an eviction gate: a sharing reader approves reuse."""
++
++import pytest
++
++from tests.v1.kv_offload.cpu.test_manager import (
++    _EMPTY_REQ_CTX,
++    ExpectedPrepareStoreOutput,
++    make_cpu_manager,
++    to_key,
++    to_keys,
++    verify_load_output,
++    verify_store_output,
++)
++from vllm.v1.kv_offload.base import LookupResult, Medium, OffloadingEvent
++from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
++
++
++class _Gate:
++    """Hold back the keys in ``blocked``; release everything else."""
++
++    def __init__(self, *blocked: int):
++        self.blocked = set(to_keys(list(blocked)))
++        self.calls: list[list] = []
++        self.released_all = 0
++
++    def __call__(self, keys):
++        self.calls.append(list(keys))
++        return {key: key not in self.blocked for key in keys}
++
++    def release_all(self) -> None:
++        self.released_all += 1
++
++
++def _gated(gate: _Gate, num_chunks: int, policy: str) -> CPUOffloadingManager:
++    manager = make_cpu_manager(
++        num_chunks=num_chunks, cache_policy=policy, enable_events=True
++    )
++    manager.set_eviction_gate(gate, gate.release_all)
++    return manager
++
++
++def _store(manager: CPUOffloadingManager, *int_hashes: int):
++    keys = to_keys(list(int_hashes))
++    output = manager.prepare_store(keys, _EMPTY_REQ_CTX)
++    if output is not None:
++        manager.complete_store(output.keys_to_store, _EMPTY_REQ_CTX)
++    return output
++
++
++def _events(manager: CPUOffloadingManager) -> list[tuple[list, bool]]:
++    return [(event.keys, event.removed) for event in manager.take_events()]
++
++
++@pytest.mark.parametrize("policy", ["lru", "arc"])
++def test_a_held_back_victim_leaves_the_cache_but_keeps_its_slot(policy) -> None:
++    gate = _Gate(1)
++    manager = _gated(gate, 2, policy)
++    _store(manager, 1)
++    _store(manager, 2)
++    _events(manager)
++
++    output = manager.prepare_store(to_keys([3]), _EMPTY_REQ_CTX)
++
++    # Key 1 is held back, so key 2's slot is the one reused.
++    verify_store_output(
++        output,
++        ExpectedPrepareStoreOutput(
++            keys_to_store=[3], store_chunk_ids=[1], evicted_keys=[1, 2]
++        ),
++    )
++    assert gate.calls == [to_keys([1]), to_keys([2])]
++    assert _events(manager) == [(to_keys([1, 2]), True)]
++
++
++@pytest.mark.parametrize("policy", ["lru", "arc"])
++def test_a_held_back_slot_is_freed_once_the_gate_lets_go(policy) -> None:
++    gate = _Gate(1)
++    manager = _gated(gate, 2, policy)
++    _store(manager, 1)
++    _store(manager, 2)
++    _store(manager, 3)
++    gate.blocked.clear()
++    gate.calls.clear()
++
++    output = manager.prepare_store(to_keys([4]), _EMPTY_REQ_CTX)
++
++    # The slot key 1 kept is reused without evicting anything else.
++    verify_store_output(
++        output,
++        ExpectedPrepareStoreOutput(
++            keys_to_store=[4], store_chunk_ids=[0], evicted_keys=[]
++        ),
++    )
++    assert gate.calls == [to_keys([1])]
++
++
++@pytest.mark.parametrize("policy", ["lru", "arc"])
++def test_a_held_back_chunk_is_rescued_by_a_lookup(policy) -> None:
++    gate = _Gate(1)
++    manager = _gated(gate, 2, policy)
++    _store(manager, 1)
++    _store(manager, 2)
++    _store(manager, 3)
++    _events(manager)
++
++    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.HIT
++    verify_load_output(manager.prepare_load(to_keys([1]), _EMPTY_REQ_CTX), [0])
++    assert _events(manager) == [(to_keys([1]), False)]
++
++
++@pytest.mark.parametrize("policy", ["lru", "arc"])
++def test_storing_a_held_back_key_rescues_it_instead_of_copying(policy) -> None:
++    gate = _Gate(1)
++    manager = _gated(gate, 2, policy)
++    _store(manager, 1)
++    _store(manager, 2)
++    _store(manager, 3)
++
++    output = manager.prepare_store(to_keys([1]), _EMPTY_REQ_CTX)
++
++    verify_store_output(
++        output,
++        ExpectedPrepareStoreOutput(
++            keys_to_store=[], store_chunk_ids=[], evicted_keys=[]
++        ),
++    )
++    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.HIT
++
++
++@pytest.mark.parametrize("policy", ["lru", "arc"])
++def test_a_store_fails_when_the_gate_holds_back_too_much(policy) -> None:
++    gate = _Gate(1, 2)
++    manager = _gated(gate, 2, policy)
++    _store(manager, 1)
++    _store(manager, 2)
++    _events(manager)
++
++    assert manager.prepare_store(to_keys([3]), _EMPTY_REQ_CTX) is None
++
++    # Both left the cache while the gate kept their slots.
++    assert _events(manager) == [(to_keys([1, 2]), True)]
++    assert manager.lookup(to_key(3), _EMPTY_REQ_CTX) is LookupResult.MISS
++    gate.blocked.clear()
++    verify_store_output(
++        manager.prepare_store(to_keys([3]), _EMPTY_REQ_CTX),
++        ExpectedPrepareStoreOutput(
++            keys_to_store=[3], store_chunk_ids=[1], evicted_keys=[]
++        ),
++    )
++
++
++@pytest.mark.parametrize("policy", ["lru", "arc"])
++def test_restored_chunks_are_ready_and_keep_their_slots(policy) -> None:
++    manager = make_cpu_manager(num_chunks=4, cache_policy=policy, enable_events=True)
++
++    manager.restore({to_key(1): 2, to_key(2): 0})
++
++    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.HIT
++    verify_load_output(manager.prepare_load(to_keys([2, 1]), _EMPTY_REQ_CTX), [0, 2])
++    manager.complete_load(to_keys([2, 1]), _EMPTY_REQ_CTX)
++    assert list(manager.take_events()) == [
++        OffloadingEvent(keys=to_keys([1, 2]), medium=Medium.CPU, removed=False)
++    ]
++    # New stores take the free slots, lowest first, then evict a restored chunk.
++    verify_store_output(
++        manager.prepare_store(to_keys([3, 4]), _EMPTY_REQ_CTX),
++        ExpectedPrepareStoreOutput(
++            keys_to_store=[3, 4], store_chunk_ids=[1, 3], evicted_keys=[]
++        ),
++    )
++    manager.complete_store(to_keys([3, 4]), _EMPTY_REQ_CTX)
++    output = manager.prepare_store(to_keys([5]), _EMPTY_REQ_CTX)
++    assert output is not None
++    assert len(output.evicted_keys) == 1
++    assert output.evicted_keys[0] in to_keys([1, 2, 3, 4])
++
++
++def test_restoring_nothing_keeps_fresh_allocation() -> None:
++    manager = make_cpu_manager(num_chunks=2)
++    manager.restore({})
++    verify_store_output(
++        manager.prepare_store(to_keys([1]), _EMPTY_REQ_CTX),
++        ExpectedPrepareStoreOutput(
++            keys_to_store=[1], store_chunk_ids=[0], evicted_keys=[]
++        ),
++    )
++
++
++def test_reset_asks_the_gate_to_release_every_slot() -> None:
++    gate = _Gate(1)
++    manager = _gated(gate, 2, "lru")
++    _store(manager, 1)
++    _store(manager, 2)
++    _store(manager, 3)
++
++    manager.reset_cache()
++
++    assert gate.released_all == 1
++    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.MISS
++    verify_store_output(
++        manager.prepare_store(to_keys([4, 5]), _EMPTY_REQ_CTX),
++        ExpectedPrepareStoreOutput(
++            keys_to_store=[4, 5], store_chunk_ids=[0, 1], evicted_keys=[]
++        ),
++    )
+diff --git a/tests/v1/kv_offload/tiering/test_kvcr_single_dram_tier.py b/tests/v1/kv_offload/tiering/test_kvcr_single_dram_tier.py
+new file mode 100644
+index 0000000000..7580d45a0c
+--- /dev/null
++++ b/tests/v1/kv_offload/tiering/test_kvcr_single_dram_tier.py
+@@ -0,0 +1,432 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""KVCR as a single DRAM tier: the primary tier lives in the KVCR service pool."""
++
++import ctypes
++import mmap
++from collections.abc import Collection, Mapping
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++
++pytest.importorskip("kvcr")
++
++from kvcr.types import BlockKey, CacheTier, InventoryEvent, QueryStatus
++
++from tests.v1.kv_offload.test_factory import _make_offloading_config
++from tests.v1.kv_offload.tiering.test_kvcr_tier import (
++    RecordingKVCR,
++    _job,
++    _StubControlChannel,
++)
++from vllm.v1.kv_offload.base import (
++    LookupResult,
++    Medium,
++    OffloadKey,
++    ReqContext,
++    ScheduleEndContext,
++)
++from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
++from vllm.v1.kv_offload.tiering.base import JobResult
++from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
++from vllm.v1.kv_offload.tiering.kvcr import manager as kvcr_manager
++from vllm.v1.kv_offload.tiering.kvcr import shared_tier
++from vllm.v1.kv_offload.tiering.kvcr.manager import KVCRSecondaryTierManager
++from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
++
++_CHUNK = mmap.PAGESIZE
++_CHUNKS = 4
++_CTX = ReqContext(req_id="req")
++
++
++class _PoolKVCR(RecordingKVCR):
++    """A KVCR whose claimed pool is real memory and whose slots the caller places."""
++
++    def __init__(
++        self,
++        size: int = _CHUNK * _CHUNKS,
++        recovered: Mapping[BlockKey, list[tuple[str, int]]] | None = None,
++    ) -> None:
++        super().__init__()
++        self.pool = mmap.mmap(-1, size)
++        self.address = ctypes.addressof(ctypes.c_char.from_buffer(self.pool))
++        self.held: dict[BlockKey, list[tuple[str, int]]] = dict(recovered or {})
++        self.blocked: set[BlockKey] = set()
++        self.commits: list[dict[BlockKey, list[tuple[str, int]]]] = []
++        self.closed = 0
++
++    def local_dram_pools(self) -> list[tuple[str, int, int]]:
++        return [("", self.address, len(self.pool))]
++
++    def local_dram_residency(self) -> dict[BlockKey, list[tuple[str, int]]]:
++        return {key: list(slots) for key, slots in self.held.items()}
++
++    def commit_framework_slots(self, blocks) -> None:
++        if any(key in self.held for key in blocks):
++            raise ValueError("local DRAM already holds it")
++        blocks = {key: list(slots) for key, slots in blocks.items()}
++        self.commits.append(blocks)
++        self.held.update(blocks)
++
++    def try_retire_framework_slots(
++        self, keys: Collection[BlockKey]
++    ) -> dict[BlockKey, bool]:
++        results = {}
++        for key in keys:
++            if key not in self.held:
++                raise ValueError("local DRAM does not hold it")
++            results[key] = key not in self.blocked
++            if results[key]:
++                del self.held[key]
++        return results
++
++    def close(self) -> None:
++        self.closed += 1
++
++
++def _install(monkeypatch, kvcr: _PoolKVCR) -> None:
++    def make_kvcr(config, bindings, backend_configs, guard_config):
++        kvcr.config = config
++        kvcr.guard_config = guard_config
++        kvcr.nixl_agent_name = config.nixl_agent_name
++        kvcr.backend_configs = backend_configs
++        kvcr.constructor_bindings = bindings
++        kvcr.inventory_sink = bindings.inventory_sink
++        return kvcr
++
++    def make_control(_bind_host, bind_port, advertise_host):
++        return _StubControlChannel(f"tcp://{advertise_host}:{int(bind_port)}")
++
++    monkeypatch.setattr(kvcr_manager, "KVCR", make_kvcr)
++    monkeypatch.setattr(kvcr_manager, "ZmqPeerControlChannel", make_control)
++
++
++def _tier_config(**overrides) -> dict:
++    config = {
++        "type": "kvcr",
++        "single_dram_tier": True,
++        "router_capabilities": ["router_hint"],
++        "control_host": "127.0.0.1",
++        "control_ports": [7777],
++        "control_advertise_host": "127.0.0.1",
++        "kvcr_service_socket_path": "/tmp/kvcr.sock",
++        "compatibility_digest": "digest",
++    }
++    config.update(overrides)
++    return config
++
++
++def _make_tier(monkeypatch, kvcr: _PoolKVCR, **overrides) -> KVCRSecondaryTierManager:
++    _install(monkeypatch, kvcr)
++    tier = SecondaryTierFactory.create_secondary_tier(
++        tier_config=_tier_config(**overrides),
++        primary_kv_view=None,
++        offloading_spec=SimpleNamespace(
++            num_chunks=_CHUNKS,
++            kv_bytes_per_chunk=_CHUNK,
++            config=SimpleNamespace(
++                parallel=SimpleNamespace(data_parallel_rank_local=None)
++            ),
++            kv_events_config=SimpleNamespace(
++                enable_kv_cache_events=True,
++                self_describing_kv_events=True,
++            ),
++        ),
++    )
++    assert isinstance(tier, KVCRSecondaryTierManager)
++    return tier
++
++
++def _key(name: str) -> OffloadKey:
++    return OffloadKey(name.encode())
++
++
++def _block(name: str) -> BlockKey:
++    return BlockKey(name.encode())
++
++
++def test_the_primary_view_is_the_claimed_pool(monkeypatch) -> None:
++    kvcr = _PoolKVCR()
++    tier = _make_tier(monkeypatch, kvcr)
++
++    assert kvcr.config.framework_managed_slots
++    assert kvcr.config.pool_layouts == [("", _CHUNK)]
++    # KVCR addresses the primary chunks through its own pool.
++    assert kvcr.backend_configs.framework_regions == []
++    assert kvcr.backend_configs.local_dram is None
++    assert tier.pool_address == kvcr.address
++    assert tier.block_size_bytes == _CHUNK
++    view = np.asarray(tier._primary_kv_view)
++    assert view.shape == (_CHUNKS, _CHUNK)
++    assert view.ctypes.data == kvcr.address
++
++
++@pytest.mark.parametrize(
++    ("overrides", "message"),
++    [
++        ({"kvcr_service_socket_path": None, "compatibility_digest": None}, "needs"),
++        ({"secondary_g2_slots": 2}, "cannot both"),
++    ],
++)
++def test_a_single_tier_needs_the_service_pool(monkeypatch, overrides, message) -> None:
++    with pytest.raises(ValueError, match=message):
++        _make_tier(monkeypatch, _PoolKVCR(), **overrides)
++
++
++def test_a_pool_smaller_than_the_primary_tier_is_refused(monkeypatch) -> None:
++    kvcr = _PoolKVCR(size=_CHUNK * (_CHUNKS - 1))
++    with pytest.raises(ValueError, match="pool-sizes-gb"):
++        _make_tier(monkeypatch, kvcr)
++    assert kvcr.closed == 1
++
++
++def test_a_cascade_records_chunks_without_copying(monkeypatch) -> None:
++    kvcr = _PoolKVCR()
++    tier = _make_tier(monkeypatch, kvcr)
++
++    tier.submit_store(_job(1, _CTX, key=_key("a"), chunk_id=2))
++    tier.submit_store(_job(2, _CTX, key=_key("a"), chunk_id=2))
++
++    assert kvcr.deposit_calls == []
++    assert kvcr.commits == [{_block("a"): [("", 2)]}]
++    assert list(tier.get_finished_jobs()) == [JobResult(1, True), JobResult(2, True)]
++
++
++def test_the_eviction_gate_frees_only_what_kvcr_lets_go(monkeypatch) -> None:
++    kvcr = _PoolKVCR()
++    tier = _make_tier(monkeypatch, kvcr)
++    tier.submit_store(_job(1, _CTX, key=_key("held"), chunk_id=0))
++    tier.submit_store(_job(2, _CTX, key=_key("free"), chunk_id=1))
++    kvcr.blocked.add(_block("held"))
++
++    assert tier.retire_chunks([_key("held"), _key("free"), _key("unknown")]) == {
++        _key("held"): False,
++        _key("free"): True,
++        _key("unknown"): True,
++    }
++    assert set(kvcr.held) == {_block("held")}
++
++    kvcr.blocked.clear()
++    assert tier.retire_chunks([_key("held")]) == {_key("held"): True}
++    assert kvcr.held == {}
++
++
++def test_a_promotion_is_recorded_once_its_chunks_land(monkeypatch) -> None:
++    kvcr = _PoolKVCR()
++    tier = _make_tier(monkeypatch, kvcr)
++    kvcr.query_status = QueryStatus.FETCHABLE
++
++    assert tier.lookup(_key("remote"), _CTX) is LookupResult.HIT
++    tier.submit_load(_job(3, _CTX, key=_key("remote"), chunk_id=3))
++
++    assert list(tier.get_finished_jobs()) == [JobResult(3, True)]
++    assert kvcr.commits == [{_block("remote"): [("", 3)]}]
++
++
++def test_a_failed_promotion_records_nothing(monkeypatch) -> None:
++    kvcr = _PoolKVCR()
++    tier = _make_tier(monkeypatch, kvcr)
++
++    def failing_deliver(blocks, request_id=None):
++        op_handle = kvcr._next_op_handle
++        kvcr._next_op_handle += 1
++        kvcr.complete(op_handle, dict.fromkeys(blocks, False))
++        return op_handle
++
++    kvcr.deliver = failing_deliver
++    tier.submit_load(_job(4, _CTX, key=_key("lost"), chunk_id=1))
++
++    assert [result.success for result in tier.get_finished_jobs()] == [False]
++    assert kvcr.commits == []
++
++
++def test_a_block_already_in_the_pool_is_not_promoted_into_it(monkeypatch) -> None:
++    kvcr = _PoolKVCR()
++    tier = _make_tier(monkeypatch, kvcr)
++    kvcr.query_status = QueryStatus.HIT
++
++    assert tier.lookup(_key("local"), _CTX) is LookupResult.MISS
++
++
++def test_recovered_chunks_are_handed_to_the_primary_tier(monkeypatch) -> None:
++    kvcr = _PoolKVCR(recovered={_block("kept"): [("", 1)]})
++    tier = _make_tier(monkeypatch, kvcr)
++
++    assert tier.take_recovered_chunks() == {_key("kept"): 1}
++    assert tier.take_recovered_chunks() == {}
++    # Recovered chunks are KVCR's to release like any recorded one.
++    assert tier.retire_chunks([_key("kept")]) == {_key("kept"): True}
++
++
++def test_a_recovered_chunk_outside_the_primary_tier_is_refused(monkeypatch) -> None:
++    kvcr = _PoolKVCR(recovered={_block("far"): [("", _CHUNKS)]})
++    with pytest.raises(ValueError, match="compatibility_digest"):
++        _make_tier(monkeypatch, kvcr)
++    assert kvcr.closed == 1
++
++
++def test_only_disk_inventory_is_announced_by_the_tier(monkeypatch) -> None:
++    kvcr = _PoolKVCR()
++    tier = _make_tier(monkeypatch, kvcr)
++    key = _block("k")
++
++    kvcr.inventory_sink(InventoryEvent((key,), CacheTier.LOCAL_G2, False))
++    kvcr.inventory_sink(InventoryEvent((key,), CacheTier.G3, False))
++
++    assert [(event.keys, event.medium) for event in tier.take_events()] == [
++        ([OffloadKey(bytes(key))], Medium.STORAGE)
++    ]
++
++
++def test_release_all_waits_until_every_chunk_is_let_go(monkeypatch) -> None:
++    kvcr = _PoolKVCR()
++    tier = _make_tier(monkeypatch, kvcr)
++    tier.submit_store(_job(1, _CTX, key=_key("spilling"), chunk_id=0))
++    kvcr.blocked.add(_block("spilling"))
++    polls = []
++
++    def poll_completed():
++        polls.append(None)
++        kvcr.blocked.clear()  # The spill lands.
++        return []
++
++    kvcr.poll_completed = poll_completed
++    tier.release_all()
++
++    assert kvcr.held == {}
++    assert polls == [None]
++
++
++def test_the_last_user_of_a_shared_tier_closes_it(monkeypatch) -> None:
++    kvcr = _PoolKVCR()
++    created = []
++
++    def create():
++        created.append(_make_tier(monkeypatch, kvcr))
++        return created[-1]
++
++    worker = shared_tier.acquire("engine", create)
++    scheduler = shared_tier.acquire("engine", create)
++
++    assert worker is scheduler and len(created) == 1
++    scheduler.shutdown()
++    assert kvcr.closed == 0
++    shared_tier.release("engine")
++    assert kvcr.closed == 1
++    assert "engine" not in shared_tier._tiers
++
++
++def test_a_borrowed_region_views_the_owners_memory_and_leaves_it() -> None:
++    owner = mmap.mmap(-1, _CHUNK * _CHUNKS)
++    address = ctypes.addressof(ctypes.c_char.from_buffer(owner))
++    released = []
++
++    region = SharedOffloadRegion.borrow(
++        address, _CHUNKS, 0, _CHUNK, _CHUNK, on_cleanup=lambda: released.append(1)
++    )
++    view = region.create_next_worker_view(_CHUNK)
++    view[2].fill_(7)
++    kv_view = region.create_kv_memoryview()
++
++    assert owner[2 * _CHUNK : 3 * _CHUNK] == bytes([7]) * _CHUNK
++    assert np.asarray(kv_view).ctypes.data == address
++    kv_view.release()
++    region.cleanup()
++    region.cleanup()
++    assert released == [1]
++    # The owner's mapping is untouched.
++    owner[0:1] = b"\x01"
++
++
++def test_the_spec_builds_the_primary_tier_in_the_pool(monkeypatch) -> None:
++    kvcr = _PoolKVCR(recovered={_block("kept"): [("", 2)]})
++    _install(monkeypatch, kvcr)
++    spec = TieringOffloadingSpec(
++        _make_offloading_config(
++            spec_name="TieringOffloadingSpec",
++            cpu_bytes_to_use=_CHUNK * _CHUNKS,
++            worker_kv_bytes_per_block=_CHUNK,
++            extra_config={
++                "self_describing_kv_events": True,
++                "secondary_tiers": [_tier_config()],
++            },
++        )
++    )
++    assert spec.num_chunks == _CHUNKS
++
++    manager = spec.get_manager()
++    primary = manager.primary_tier
++    (tier,) = manager.secondary_tiers
++
++    assert spec._shared_tier() is tier
++    shared_tier.release(spec._engine_id)
++    assert np.asarray(primary.get_kv_memoryview()).ctypes.data == kvcr.address
++    # The pool's recovered chunk is a primary hit at its slot.
++    assert primary.lookup(_key("kept"), _CTX) is LookupResult.HIT
++    # Filling the tier evicts through KVCR, which must agree first.
++    keys = [_key(f"new{index}") for index in range(_CHUNKS)]
++    kvcr.blocked.add(_block("kept"))
++    output = primary.prepare_store(keys, _CTX)
++    assert output is None
++    kvcr.blocked.clear()
++    output = primary.prepare_store(keys, _CTX)
++    assert output is not None and len(output.keys_to_store) == _CHUNKS
++
++    manager.shutdown()
++    assert kvcr.closed == 1
++
++
++def test_single_dram_tier_needs_one_worker_per_engine() -> None:
++    with pytest.raises(ValueError, match="one worker per engine"):
++        TieringOffloadingSpec(
++            _make_offloading_config(
++                spec_name="TieringOffloadingSpec",
++                cpu_bytes_to_use=_CHUNK * _CHUNKS,
++                worker_kv_bytes_per_block=_CHUNK,
++                world_size=2,
++                extra_config={"secondary_tiers": [_tier_config()]},
++            )
++        )
++
++
++def test_stores_and_evictions_flow_through_kvcr_without_copies(monkeypatch) -> None:
++    kvcr = _PoolKVCR()
++    _install(monkeypatch, kvcr)
++    spec = TieringOffloadingSpec(
++        _make_offloading_config(
++            spec_name="TieringOffloadingSpec",
++            cpu_bytes_to_use=_CHUNK * 2,
++            worker_kv_bytes_per_block=_CHUNK,
++            extra_config={"secondary_tiers": [_tier_config()]},
++        )
++    )
++    manager = spec.get_manager()
++    ctx = ReqContext(req_id="r1")
++    manager.on_new_request(ctx)
++
++    def store(*names: str) -> list[int]:
++        keys = [_key(name) for name in names]
++        output = manager.prepare_store(keys, ctx)
++        assert output is not None
++        manager.complete_store(output.keys_to_store, ctx)
++        # One scheduler step: the cascade's job results unpin the chunks.
++        manager.on_schedule_end(ScheduleEndContext((), ()))
++        return [int(chunk) for chunk in output.store_spec.chunk_ids]
++
++    assert store("a", "b") == [0, 1]
++    # GPU -> pool once; the cascade only records the chunks.
++    assert kvcr.deposit_calls == []
++    assert kvcr.held == {_block("a"): [("", 0)], _block("b"): [("", 1)]}
++
++    # "a" is the LRU victim but KVCR still reads it, so "b"'s slot is reused.
++    kvcr.blocked.add(_block("a"))
++    assert store("c") == [1]
++    assert set(kvcr.held) == {_block("a"), _block("c")}
++    # "a" left the cache but its bytes are intact: a lookup takes it back.
++    assert manager.lookup(_key("a"), ctx) is LookupResult.HIT
++
++    kvcr.blocked.clear()
++    manager.on_request_finished(ctx)
++    manager.shutdown()
++    assert kvcr.closed == 1
+diff --git a/vllm/v1/kv_offload/cpu/manager.py b/vllm/v1/kv_offload/cpu/manager.py
+index 2c08ac897c..aa6e320b1a 100644
+--- a/vllm/v1/kv_offload/cpu/manager.py
++++ b/vllm/v1/kv_offload/cpu/manager.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from collections import OrderedDict
+-from collections.abc import Collection, Iterable
++from collections.abc import Callable, Collection, Iterable, Mapping
+ from dataclasses import dataclass, field
+ 
+ from typing_extensions import override
+@@ -29,6 +29,9 @@ from vllm.v1.kv_offload.cpu.policies.base import CachePolicy, ChunkStatus
+ from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
+ from vllm.v1.metrics.cache_hit_source import CacheHitSource
+ 
++# Decides, for chunks just evicted, which slots may be reused now.
++EvictionGate = Callable[[list[OffloadKey]], Mapping[OffloadKey, bool]]
++
+ 
+ @dataclass(slots=True)
+ class _RequestCacheAccess:
+@@ -89,6 +92,102 @@ class CPUOffloadingManager(OffloadingManager):
+             OrderedDict() if store_threshold >= 2 else None
+         )
+ 
++        # Set when another reader shares this memory and must agree before an
++        # evicted chunk's slot is reused. A chunk it holds back has left the
++        # cache but keeps its slot, and its bytes, until a later call frees it.
++        self._eviction_gate: EvictionGate | None = None
++        self._release_all: Callable[[], None] | None = None
++        self._retiring: dict[OffloadKey, ChunkStatus] = {}
++
++    def set_eviction_gate(
++        self, gate: EvictionGate, release_all: Callable[[], None]
++    ) -> None:
++        """Have ``gate`` approve every slot reuse; ``release_all`` before a reset."""
++        self._eviction_gate = gate
++        self._release_all = release_all
++
++    def restore(self, chunks: Mapping[OffloadKey, int]) -> None:
++        """Seed ready chunks whose slots already hold their keys' bytes.
++
++        Only before anything else is stored. Restored chunks are evictable at
++        once, and the remaining slots are allocated as before.
++        """
++        if not chunks:
++            return
++        assert self._num_allocated_chunks == 0 and not self._free_list
++        chunk_ids = set(chunks.values())
++        assert len(chunk_ids) == len(chunks), "restored chunks share a slot"
++        assert all(0 <= chunk_id < self._num_chunks for chunk_id in chunk_ids)
++        for key, chunk_id in chunks.items():
++            assert self._policy.get(key) is None, f"Chunk {key!r} already cached"
++            chunk = ChunkStatus(chunk_id)
++            chunk.ref_cnt = 0
++            self._policy.insert(key, chunk)
++        self._num_evictable_cache_chunks += len(chunks)
++        # Every slot counts as allocated; the free ones are handed out lowest first.
++        self._num_allocated_chunks = self._num_chunks
++        self._free_list = [
++            chunk_id
++            for chunk_id in reversed(range(self._num_chunks))
++            if chunk_id not in chunk_ids
++        ]
++        if self.events is not None:
++            self.events.append(
++                OffloadingEvent(keys=list(chunks), medium=self.medium, removed=False)
++            )
++
++    def _rescue(self, keys: Iterable[OffloadKey]) -> None:
++        """Return held-back chunks to the cache: their bytes are still intact."""
++        rescued = []
++        for key in keys:
++            chunk = self._retiring.pop(key, None)
++            if chunk is None:
++                continue
++            self._policy.insert(key, chunk)
++            self._num_evictable_cache_chunks += 1
++            rescued.append(key)
++        if rescued and self.events is not None:
++            self.events.append(
++                OffloadingEvent(keys=rescued, medium=self.medium, removed=False)
++            )
++
++    def _release_retiring(self) -> None:
++        if not self._retiring:
++            return
++        assert self._eviction_gate is not None
++        released = self._eviction_gate(list(self._retiring))
++        for key, ok in released.items():
++            if ok and key in self._retiring:
++                self._free_chunk(self._retiring.pop(key))
++
++    def _evict_through_gate(
++        self, num_chunks: int, protected: set[OffloadKey]
++    ) -> tuple[list[OffloadKey], bool]:
++        """Evict until num_chunks slots are free, holding back what the gate keeps.
++
++        Every chunk taken from the policy has left the cache, freed or held, so
++        all of them are returned for the removal event even when not enough
++        slots came free.
++        """
++        assert self._eviction_gate is not None
++        evicted_keys: list[OffloadKey] = []
++        freed = 0
++        while freed < num_chunks:
++            evicted = self._policy.evict(num_chunks - freed, protected)
++            if evicted is None:
++                return evicted_keys, False
++            self._num_evictable_cache_chunks -= len(evicted)
++            assert self._num_evictable_cache_chunks >= 0
++            released = self._eviction_gate([key for key, _ in evicted])
++            for key, chunk in evicted:
++                evicted_keys.append(key)
++                if released.get(key, False):
++                    self._free_chunk(chunk)
++                    freed += 1
++                else:
++                    self._retiring[key] = chunk
++        return evicted_keys, True
++
+     # --- chunk pool ---
+ 
+     def _get_num_free_chunks(self) -> int:
+@@ -188,6 +287,9 @@ class CPUOffloadingManager(OffloadingManager):
+     @override
+     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+         chunk = self._policy.get(key)
++        if chunk is None and key in self._retiring:
++            self._rescue((key,))
++            chunk = self._policy.get(key)
+         if chunk is None:
+             return LookupResult.MISS
+         if not chunk.is_ready:
+@@ -254,6 +356,9 @@ class CPUOffloadingManager(OffloadingManager):
+         req_context: ReqContext,
+     ) -> PrepareStoreOutput | None:
+         keys = list(keys)
++        if self._eviction_gate is not None:
++            self._release_retiring()
++            self._rescue(keys)
+         if self.counts is not None:
+             self._record_accesses(keys)
+         # Partition the original offer before admission filtering. Ready
+@@ -321,17 +426,30 @@ class CPUOffloadingManager(OffloadingManager):
+             # Chunks from the original input are excluded from eviction candidates:
+             # a chunk that was already stored must remain in the cache after this call.
+             protected = set(keys)
+-            evicted = self._policy.evict(num_chunks_to_evict, protected)
+-            if evicted is None:
+-                return None
++            if self._eviction_gate is not None:
++                to_evict, enough = self._evict_through_gate(
++                    num_chunks_to_evict, protected
++                )
++                if not enough:
++                    if to_evict and self.events is not None:
++                        self.events.append(
++                            OffloadingEvent(
++                                keys=to_evict, medium=self.medium, removed=True
++                            )
++                        )
++                    return None
++            else:
++                evicted = self._policy.evict(num_chunks_to_evict, protected)
++                if evicted is None:
++                    return None
+ 
+-            # cache-policy removes only idle chunks.
+-            self._num_evictable_cache_chunks -= len(evicted)
+-            assert self._num_evictable_cache_chunks >= 0
++                # cache-policy removes only idle chunks.
++                self._num_evictable_cache_chunks -= len(evicted)
++                assert self._num_evictable_cache_chunks >= 0
+ 
+-            for key, chunk in evicted:
+-                self._free_chunk(chunk)
+-                to_evict.append(key)
++                for key, chunk in evicted:
++                    self._free_chunk(chunk)
++                    to_evict.append(key)
+ 
+         if to_evict and self.events is not None:
+             self.events.append(
+@@ -432,6 +550,11 @@ class CPUOffloadingManager(OffloadingManager):
+         # pre-reset jobs, so no lazy cleanup is needed. The scheduler also
+         # flushes in-flight load job IDs to the workers before any new stores
+         # can begin, preventing a cross-direction data race on reused offload chunk IDs.
++        if self._release_all is not None:
++            # Every slot is about to be reused, so a reader sharing them must
++            # let go of all of them first.
++            self._release_all()
++        self._retiring.clear()
+         self._policy.clear()
+         self._cache_generation += 1
+         self._num_evictable_cache_chunks = 0
+diff --git a/vllm/v1/kv_offload/cpu/shared_offload_region.py b/vllm/v1/kv_offload/cpu/shared_offload_region.py
+index af183fbc4f..073d37ed52 100644
+--- a/vllm/v1/kv_offload/cpu/shared_offload_region.py
++++ b/vllm/v1/kv_offload/cpu/shared_offload_region.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import contextlib
++import ctypes
+ import errno
+ import mmap
+ import os
+@@ -85,6 +86,8 @@ class SharedOffloadRegion:
+     """
+ 
+     BLOCK_SIZE_ALIGNMENT: int = mmap.PAGESIZE
++    # Set only on a borrowed region: runs once, after its cleanup.
++    _on_cleanup: Callable[[], None] | None = None
+ 
+     def __init__(
+         self,
+@@ -236,6 +239,44 @@ class SharedOffloadRegion:
+                 "MADV_POPULATE_WRITE entire region: %.3f s", time.perf_counter() - _t0
+             )
+ 
++    @classmethod
++    def borrow(
++        cls,
++        address: int,
++        num_chunks: int,
++        rank: int | None,
++        kv_bytes_per_chunk: int,
++        cpu_page_size: int,
++        on_cleanup: Callable[[], None] | None = None,
++    ) -> "SharedOffloadRegion":
++        """A region over memory another owner keeps mapped, such as a KVCR pool.
++
++        Nothing is created, populated or unlinked here: the owner already backs
++        the pages. cleanup() drops the views and pinning, then on_cleanup.
++        """
++        region = cls.__new__(cls)
++        region.page_size = mmap.PAGESIZE
++        assert kv_bytes_per_chunk % region.page_size == 0
++        assert address % region.page_size == 0
++        region.num_chunks = num_chunks
++        region._row_stride = kv_bytes_per_chunk
++        region.total_size_bytes = num_chunks * kv_bytes_per_chunk
++        region._creator = False
++        region.rank = rank
++        if rank is not None:
++            region._worker_offset = rank * cpu_page_size
++            region._worker_area_end = (rank + 1) * cpu_page_size
++        region.fd = None
++        region.mmap_obj = None
++        buffer = (ctypes.c_char * region.total_size_bytes).from_address(address)
++        region._base = torch.frombuffer(buffer, dtype=torch.int8)
++        region._views = []
++        region._canonical_offset = 0
++        region.is_pinned = False
++        region.pinned_addresses = []
++        region._on_cleanup = on_cleanup
++        return region
++
+     @property
+     def base_tensor(self) -> torch.Tensor:
+         if self._base is None:
+@@ -386,3 +427,7 @@ class SharedOffloadRegion:
+                     "Failed to unlink path %s", self.mmap_path, exc_info=True
+                 )
+             self._creator = False
++        on_cleanup = self._on_cleanup
++        if on_cleanup is not None:
++            self._on_cleanup = None
++            on_cleanup()
+diff --git a/vllm/v1/kv_offload/tiering/factory.py b/vllm/v1/kv_offload/tiering/factory.py
+index 6a460724de..20d3b7dc54 100644
+--- a/vllm/v1/kv_offload/tiering/factory.py
++++ b/vllm/v1/kv_offload/tiering/factory.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import importlib
+ from collections.abc import Callable
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, cast
+ 
+ from vllm.logger import init_logger
+ from vllm.v1.kv_offload.tiering.base import SecondaryTierManager
+@@ -62,7 +62,7 @@ class SecondaryTierFactory:
+     def create_secondary_tier(
+         cls,
+         tier_config: dict,
+-        primary_kv_view: memoryview,
++        primary_kv_view: memoryview | None,
+         offloading_spec: "OffloadingSpec",
+     ) -> SecondaryTierManager:
+         tier_cls = cls.get_tier_class(tier_config)
+@@ -90,7 +90,9 @@ class SecondaryTierFactory:
+             bp_detector = detector_cls(policy=policy, **bp_config)
+         return tier_cls(
+             offloading_spec=offloading_spec,
+-            primary_kv_view=primary_kv_view,
++            # None reaches only a tier that builds its own view, which is what
++            # KVCR's single_dram_tier does over the pool it claims.
++            primary_kv_view=cast(memoryview, primary_kv_view),
+             tier_type=tier_type,
+             backpressure_detector=bp_detector,
+             **config,
+diff --git a/vllm/v1/kv_offload/tiering/kvcr/manager.py b/vllm/v1/kv_offload/tiering/kvcr/manager.py
+index 4804f193e3..374c3c4cb1 100644
+--- a/vllm/v1/kv_offload/tiering/kvcr/manager.py
++++ b/vllm/v1/kv_offload/tiering/kvcr/manager.py
+@@ -12,6 +12,7 @@ from pathlib import Path
+ from typing import TYPE_CHECKING, Any, cast
+ 
+ import msgspec
++import numpy as np
+ from kvcr import (
+     DURATION_METRIC,
+     KVCR,
+@@ -79,9 +80,11 @@ from vllm.v1.kv_offload.tiering.base import (
+     SecondaryTierManager,
+     TransferJob,
+ )
++from vllm.v1.kv_offload.tiering.kvcr import shared_tier
+ 
+ if TYPE_CHECKING:
+     from vllm.v1.kv_offload.base import OffloadingSpec
++    from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+     from vllm.v1.kv_offload.tiering.backpressure import BackpressureDetector
+ 
+ 
+@@ -296,11 +299,30 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
+         g3: dict[str, Any] | None = None,
+         local_dram_backend: str = "UCX",
+         remote_fw_dram_backend: str = "UCX",
++        single_dram_tier: bool = False,
+         backpressure_detector: "BackpressureDetector | None" = None,
+     ) -> None:
+-        super().__init__(
+-            offloading_spec, primary_kv_view, tier_type, backpressure_detector
+-        )
++        # With single_dram_tier the primary tier lives in the pool the KVCR
++        # service owns, so its view only exists once that pool is claimed.
++        self._single_dram_tier = single_dram_tier
++        if single_dram_tier:
++            if kvcr_service_socket_path is None:
++                raise ValueError(
++                    "single_dram_tier needs kvcr_service_socket_path: the KVCR "
++                    "service owns the DRAM shared with the primary tier"
++                )
++            if secondary_g2_slots:
++                raise ValueError(
++                    "single_dram_tier and secondary_g2_slots cannot both be set"
++                )
++            cpu_spec = cast("CPUOffloadingSpec", offloading_spec)
++            num_chunks = cpu_spec.num_chunks
++            block_size_bytes = cpu_spec.kv_bytes_per_chunk
++        else:
++            super().__init__(
++                offloading_spec, primary_kv_view, tier_type, backpressure_detector
++            )
++            block_size_bytes = self.block_size_bytes
+         selected_policy = _resolve_policy(policy)
+         if (kvcr_service_socket_path is None) != (compatibility_digest is None):
+             raise ValueError(
+@@ -372,9 +394,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
+                     "kvcr_service_socket_path is configured"
+                 )
+             else:
+-                local_mapping = mmap.mmap(
+-                    -1, secondary_g2_slots * self.block_size_bytes
+-                )
++                local_mapping = mmap.mmap(-1, secondary_g2_slots * block_size_bytes)
+                 local_dram = LocalDramOptions(
+                     pools=[
+                         (
+@@ -406,12 +426,13 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
+         try:
+             self._kvcr = KVCR(
+                 KVCRConfig(
+-                    pool_layouts=[("", self.block_size_bytes)],
++                    pool_layouts=[("", block_size_bytes)],
+                     enable_telemetry=enable_telemetry,
+                     operation_timeout_ms=operation_timeout_ms,
+                     abandon_timeout_ms=abandon_timeout_ms,
+                     nixl_agent_name=nixl_agent_name,
+                     nixl_listen_port=_nixl_listen_port,
++                    framework_managed_slots=single_dram_tier,
+                 ),
+                 KVCRBindings(
+                     request_pin=self._framework_pin_adapter.request_pin,
+@@ -427,15 +448,21 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
+                     policy=selected_policy,
+                 ),
+                 KVCRBackendConfigs(
+-                    framework_regions=[
+-                        RegionDescriptor(
+-                            addr=ctypes.addressof(
+-                                ctypes.c_char.from_buffer(primary_kv_view)
+-                            ),
+-                            size=self.block_size_bytes,
+-                            count=len(primary_kv_view),
+-                        )
+-                    ],
++                    # In a single DRAM tier the primary chunks are the pool's
++                    # slots, which KVCR then addresses as framework memory.
++                    framework_regions=(
++                        []
++                        if single_dram_tier
++                        else [
++                            RegionDescriptor(
++                                addr=ctypes.addressof(
++                                    ctypes.c_char.from_buffer(primary_kv_view)
++                                ),
++                                size=block_size_bytes,
++                                count=len(primary_kv_view),
++                            )
++                        ]
++                    ),
+                     local_dram=local_dram,
+                     g3=g3_config,
+                     remote_fw_dram=RemoteFWDramOptions(
+@@ -455,11 +482,114 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
+         self._local_dram_mmap = local_mapping
+         self._finished_jobs: list[JobResult] = []
+         self._jobs_by_op: dict[OpHandle, _JobState] = {}
++        # Single DRAM tier: the primary chunk each block KVCR records sits in,
++        # and the chunks a promotion is filling until KVCR can record them.
++        self._slots: dict[BlockKey, int] = {}
++        self._promoting: dict[OpHandle, dict[BlockKey, int]] = {}
++        self._recovered: dict[OffloadKey, int] = {}
++        self._pool_address = 0
++        self._registry_key: str | None = None
++        if single_dram_tier:
++            try:
++                view = self._claimed_primary_view(num_chunks, block_size_bytes)
++                super().__init__(
++                    offloading_spec, view, tier_type, backpressure_detector
++                )
++                self._adopt_recovered(num_chunks)
++            except BaseException:
++                self._kvcr.close()
++                raise
++
++    @property
++    def pool_address(self) -> int:
++        """Where the claimed pool, and so the primary tier, starts."""
++        return self._pool_address
++
++    def _claimed_primary_view(self, num_chunks: int, block_size: int) -> memoryview:
++        ((_, address, size),) = self._kvcr.local_dram_pools()
++        needed = num_chunks * block_size
++        if size < needed:
++            raise ValueError(
++                f"the KVCR service pool holds {size} bytes, but single_dram_tier "
++                f"needs {needed} for {num_chunks} chunks of {block_size} bytes; "
++                "raise --pool-sizes-gb or lower cpu_bytes_to_use"
++            )
++        self._pool_address = address
++        buffer = (ctypes.c_char * needed).from_address(address)
++        return memoryview(
++            np.frombuffer(buffer, dtype=np.int8).reshape(num_chunks, block_size)
++        )
++
++    def _adopt_recovered(self, num_chunks: int) -> None:
++        for key, locations in self._kvcr.local_dram_residency().items():
++            ((label, slot),) = locations
++            if label or not 0 <= slot < num_chunks:
++                raise ValueError(
++                    f"the KVCR service pool recovered {key!r} at {label!r}:{slot}, "
++                    "outside this primary tier; the compatibility_digest must "
++                    "change with cpu_bytes_to_use"
++                )
++            self._slots[key] = slot
++            self._recovered[OffloadKey(bytes(key))] = slot
++
++    def take_recovered_chunks(self) -> dict[OffloadKey, int]:
++        """The primary chunks the pool still held from the previous worker."""
++        recovered, self._recovered = self._recovered, {}
++        return recovered
++
++    def retire_chunks(self, keys: list[OffloadKey]) -> dict[OffloadKey, bool]:
++        """Eviction gate for the primary tier: may these chunks be reused now?
++
++        A chunk KVCR never recorded is the primary tier's alone. One KVCR still
++        reads, or is spilling to G3, stays held back until a later call.
++        """
++        results = dict.fromkeys(keys, True)
++        held = [key for key in keys if BlockKey(bytes(key)) in self._slots]
++        if not held:
++            return results
++        retired = self._kvcr.try_retire_framework_slots(
++            [BlockKey(bytes(key)) for key in held]
++        )
++        for key in held:
++            block_key = BlockKey(bytes(key))
++            if retired[block_key]:
++                del self._slots[block_key]
++            else:
++                results[key] = False
++        return results
++
++    def release_all(self) -> None:
++        """Retire every recorded chunk before the primary tier reuses them all.
++
++        Blocks, like drain_jobs, until spills and transfers let go.
++        """
++        while self._slots:
++            self.retire_chunks([OffloadKey(bytes(key)) for key in self._slots])
++            if self._slots:
++                self._finished_jobs.extend(self._poll_finished_jobs())
++                time.sleep(0.001)
++
++    def _commit_chunks(self, chunks: dict[BlockKey, int]) -> bool:
++        new = {key: chunk for key, chunk in chunks.items() if key not in self._slots}
++        if not new:
++            return True
++        try:
++            self._kvcr.commit_framework_slots(
++                {key: [("", chunk)] for key, chunk in new.items()}
++            )
++        except ValueError:
++            logger.exception("KVCR refused primary chunks it should own")
++            return False
++        self._slots.update(new)
++        return True
+ 
+     @override
+     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+         block_key = self._key_adapter.encode(key)
+-        status, _ = self._kvcr.query((block_key,), req_context.req_id)[0]
++        status, tier = self._kvcr.query((block_key,), req_context.req_id)[0]
++        if self._single_dram_tier and tier is CacheTier.LOCAL_G2:
++            # Already a primary chunk; promoting it would copy the pool into itself.
++            return LookupResult.MISS
+         if status is QueryStatus.FETCHING:
+             return LookupResult.RETRY
+         if status in (QueryStatus.HIT, QueryStatus.FETCHABLE):
+@@ -483,6 +613,11 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
+         op_handle = self._kvcr.deliver(
+             blocks, request_id=job_metadata.req_context.req_id
+         )
++        if self._single_dram_tier:
++            self._promoting[op_handle] = {
++                self._key_adapter.encode(key): int(chunk_id)
++                for key, chunk_id in zip(job_metadata.keys, job_metadata.chunk_ids)
++            }
+         self._jobs_by_op[op_handle] = (
+             job_metadata.job_id,
+             len(blocks),
+@@ -503,6 +638,20 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
+                 JobResult(job_id=job_metadata.job_id, success=True)
+             )
+             return
++        if self._single_dram_tier:
++            # The bytes are already in the pool: record them, no copy.
++            committed = self._commit_chunks(
++                {
++                    self._key_adapter.encode(key): int(chunk_id)
++                    for key, chunk_id in zip(
++                        job_metadata.keys, job_metadata.chunk_ids, strict=True
++                    )
++                }
++            )
++            self._finished_jobs.append(
++                JobResult(job_id=job_metadata.job_id, success=committed)
++            )
++            return
+         op_handle = self._kvcr.deposit(blocks)
+         self._jobs_by_op[op_handle] = (
+             job_metadata.job_id,
+@@ -535,6 +684,16 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
+     def _poll_finished_jobs(self) -> list[JobResult]:
+         results: list[JobResult] = []
+         for op_handle, entries in self._kvcr.poll_completed():
++            promoting = self._promoting.get(op_handle)
++            if promoting is not None:
++                # A promotion filled these chunks; KVCR now records them.
++                self._commit_chunks(
++                    {
++                        key: promoting[key]
++                        for key, entry in entries.items()
++                        if entry.success and key in promoting
++                    }
++                )
+             job_state = self._jobs_by_op.get(op_handle)
+             if job_state is None:
+                 continue
+@@ -556,6 +715,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
+                 )
+                 continue
+             self._jobs_by_op.pop(op_handle, None)
++            self._promoting.pop(op_handle, None)
+             results.append(
+                 JobResult(
+                     job_id=job_id,
+@@ -602,6 +762,14 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
+     @override
+     def shutdown(self) -> None:
+         self.drain_jobs()
++        if self._registry_key is not None:
++            # The worker may still hold the pool; the last user closes KVCR.
++            shared_tier.release(self._registry_key)
++            return
++        self.close()
++
++    def close(self) -> None:
++        """Close KVCR, unmapping a claimed pool."""
+         # TODO: Keep registered buffers alive if KVCR.close() fails.
+         self._kvcr.close()
+         if self._local_dram_mmap is not None:
+@@ -610,6 +778,9 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
+ 
+     def _record_inventory(self, event: InventoryEvent) -> None:
+         if event.tier is CacheTier.LOCAL_G2:
++            if self._single_dram_tier:
++                # The primary tier announces these same chunks itself.
++                return
+             medium = Medium.CPU
+         elif event.tier is CacheTier.G3:
+             medium = Medium.STORAGE
+diff --git a/vllm/v1/kv_offload/tiering/kvcr/shared_tier.py b/vllm/v1/kv_offload/tiering/kvcr/shared_tier.py
+new file mode 100644
+index 0000000000..39f1a9e616
+--- /dev/null
++++ b/vllm/v1/kv_offload/tiering/kvcr/shared_tier.py
+@@ -0,0 +1,45 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""One KVCR single DRAM tier per engine, shared by its worker and scheduler.
++
++The worker maps the primary tier before the scheduler builds its manager, and
++both must use the pool that one claim gave this process. Whichever side comes
++first creates the tier; the last one to let go closes it.
++"""
++
++import threading
++from collections.abc import Callable
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    from vllm.v1.kv_offload.tiering.kvcr.manager import KVCRSecondaryTierManager
++
++_lock = threading.Lock()
++_tiers: dict[str, tuple["KVCRSecondaryTierManager", int]] = {}
++
++
++def acquire(
++    key: str, create: Callable[[], "KVCRSecondaryTierManager"]
++) -> "KVCRSecondaryTierManager":
++    """Return the engine's tier, creating it on first use."""
++    with _lock:
++        entry = _tiers.get(key)
++        if entry is not None:
++            tier, users = entry
++            _tiers[key] = (tier, users + 1)
++            return tier
++        tier = create()
++        tier._registry_key = key
++        _tiers[key] = (tier, 1)
++        return tier
++
++
++def release(key: str) -> None:
++    """Drop one user; the last closes KVCR and so unmaps the pool."""
++    with _lock:
++        tier, users = _tiers[key]
++        if users > 1:
++            _tiers[key] = (tier, users - 1)
++            return
++        del _tiers[key]
++    tier.close()
+diff --git a/vllm/v1/kv_offload/tiering/spec.py b/vllm/v1/kv_offload/tiering/spec.py
+index 93c6cbabcb..7686050fe9 100644
+--- a/vllm/v1/kv_offload/tiering/spec.py
++++ b/vllm/v1/kv_offload/tiering/spec.py
+@@ -52,7 +52,7 @@ Example out-of-tree tier configuration:
+ }
+ """
+ 
+-from typing import Any
++from typing import TYPE_CHECKING, Any, cast
+ 
+ import torch
+ from typing_extensions import override
+@@ -70,13 +70,20 @@ from vllm.v1.kv_offload.config import OffloadingConfig
+ from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+ from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+ from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+-from vllm.v1.kv_offload.tiering.base import TieringOffloadingMetrics
++from vllm.v1.kv_offload.tiering.base import (
++    SecondaryTierManager,
++    TieringOffloadingMetrics,
++)
+ from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
++from vllm.v1.kv_offload.tiering.kvcr import shared_tier
+ from vllm.v1.kv_offload.tiering.manager import (
+     CPUPrimaryTierOffloadingManager,
+     TieringOffloadingManager,
+ )
+ 
++if TYPE_CHECKING:
++    from vllm.v1.kv_offload.tiering.kvcr.manager import KVCRSecondaryTierManager
++
+ logger = init_logger(__name__)
+ 
+ 
+@@ -326,6 +333,36 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
+         # region.
+         self._engine_id = config.engine_id
+ 
++        # A KVCR tier with single_dram_tier makes the primary tier the pool the
++        # KVCR service owns, instead of a region of its own.
++        single = [
++            tier_cfg
++            for tier_cfg in self.secondary_tier_configs
++            if tier_cfg.get("type") == "kvcr" and tier_cfg.get("single_dram_tier")
++        ]
++        if len(single) > 1:
++            raise ValueError("only one KVCR tier can set single_dram_tier")
++        self._single_tier_config: dict[str, Any] | None = single[0] if single else None
++        if self._single_tier_config is not None and config.parallel.world_size != 1:
++            # The worker and scheduler must share this process's one pool claim.
++            raise ValueError(
++                "single_dram_tier supports one worker per engine "
++                "(tensor and pipeline parallel size 1)"
++            )
++
++    def _shared_tier(self) -> "KVCRSecondaryTierManager":
++        """The engine's single DRAM tier, claimed by whichever side asks first."""
++        tier_config = self._single_tier_config
++        assert tier_config is not None
++        return shared_tier.acquire(
++            self._engine_id,
++            # No view to give: the tier's own pool becomes the primary tier.
++            lambda: cast(
++                "KVCRSecondaryTierManager",
++                SecondaryTierFactory.create_secondary_tier(tier_config, None, self),
++            ),
++        )
++
+     @override
+     def get_manager(self) -> OffloadingManager:
+         """Get the TieringOffloadingManager.
+@@ -347,16 +384,27 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
+             scheduler_mmap: SharedOffloadRegion | None = None
+             primary_tier: CPUPrimaryTierOffloadingManager | None = None
+             secondary_tiers = []
++            single_tier: KVCRSecondaryTierManager | None = None
+             try:
+-                # Create scheduler-side SharedOffloadRegion (rank=None) so the
+-                # primary tier can eagerly create a memoryview over _base.
+-                scheduler_mmap = SharedOffloadRegion(
+-                    engine_id=self._engine_id,
+-                    num_chunks=self.num_chunks,
+-                    rank=None,
+-                    kv_bytes_per_chunk=self.kv_bytes_per_chunk,
+-                    cpu_page_size=self.cpu_page_size_per_worker,
+-                )
++                if self._single_tier_config is not None:
++                    single_tier = self._shared_tier()
++                    scheduler_mmap = SharedOffloadRegion.borrow(
++                        single_tier.pool_address,
++                        self.num_chunks,
++                        None,
++                        self.kv_bytes_per_chunk,
++                        self.cpu_page_size_per_worker,
++                    )
++                else:
++                    # Create scheduler-side SharedOffloadRegion (rank=None) so the
++                    # primary tier can eagerly create a memoryview over _base.
++                    scheduler_mmap = SharedOffloadRegion(
++                        engine_id=self._engine_id,
++                        num_chunks=self.num_chunks,
++                        rank=None,
++                        kv_bytes_per_chunk=self.kv_bytes_per_chunk,
++                        cpu_page_size=self.cpu_page_size_per_worker,
++                    )
+                 self._scheduler_mmap = scheduler_mmap
+ 
+                 # Create primary tier (CPU-based)
+@@ -368,12 +416,32 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
+                     mmap_region=scheduler_mmap,
+                 )
+ 
++                if single_tier is not None:
++                    # KVCR decides when a primary chunk's slot may be reused,
++                    # and hands back what the pool kept from a previous worker.
++                    primary_tier.set_eviction_gate(
++                        single_tier.retire_chunks, single_tier.release_all
++                    )
++                    recovered = single_tier.take_recovered_chunks()
++                    primary_tier.restore(recovered)
++                    logger.info(
++                        "Primary tier lives in the KVCR service pool at %#x; "
++                        "%d chunk(s) recovered from a previous worker",
++                        single_tier.pool_address,
++                        len(recovered),
++                    )
++
+                 # Create secondary tiers
+                 primary_kv_view = primary_tier.get_kv_memoryview()
+                 for i, tier_config in enumerate(self.secondary_tier_configs):
+-                    tier = SecondaryTierFactory.create_secondary_tier(
+-                        tier_config, primary_kv_view, self
+-                    )
++                    tier: SecondaryTierManager
++                    if tier_config is self._single_tier_config:
++                        assert single_tier is not None
++                        tier = single_tier
++                    else:
++                        tier = SecondaryTierFactory.create_secondary_tier(
++                            tier_config, primary_kv_view, self
++                        )
+                     secondary_tiers.append(tier)
+                     logger.info(
+                         "Created secondary tier #%d (%s)",
+@@ -390,6 +458,8 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
+                 )
+                 self._manager = tiering_manager
+             except Exception:
++                if single_tier is not None and single_tier not in secondary_tiers:
++                    secondary_tiers.append(single_tier)
+                 for tier in reversed(secondary_tiers):
+                     try:
+                         tier.shutdown()
+@@ -443,13 +513,30 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
+             # Fold the global physical device index into the replica-local
+             # [0, world_size) slot range.
+             rank = torch.accelerator.current_device_index() % world_size
+-        worker_mmap = SharedOffloadRegion(
+-            engine_id=self._engine_id,
+-            num_chunks=self.num_chunks,
+-            rank=rank,
+-            kv_bytes_per_chunk=self.kv_bytes_per_chunk,
+-            cpu_page_size=self.cpu_page_size_per_worker,
+-        )
++        if self._single_tier_config is not None:
++            # Runs before the scheduler builds its manager, so the pool is
++            # claimed here; the region keeps the tier until it is cleaned up.
++            single_tier = self._shared_tier()
++            try:
++                worker_mmap = SharedOffloadRegion.borrow(
++                    single_tier.pool_address,
++                    self.num_chunks,
++                    rank,
++                    self.kv_bytes_per_chunk,
++                    self.cpu_page_size_per_worker,
++                    on_cleanup=lambda: shared_tier.release(self._engine_id),
++                )
++            except BaseException:
++                shared_tier.release(self._engine_id)
++                raise
++        else:
++            worker_mmap = SharedOffloadRegion(
++                engine_id=self._engine_id,
++                num_chunks=self.num_chunks,
++                rank=rank,
++                kv_bytes_per_chunk=self.kv_bytes_per_chunk,
++                cpu_page_size=self.cpu_page_size_per_worker,
++            )
+         try:
+             if self.config.canonical_layout:
+                 self._validate_canonical_refs(kv_caches)

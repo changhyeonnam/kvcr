@@ -22,14 +22,22 @@ RUN git init /src/vllm-kvcr \
  && git -C /src/vllm-kvcr checkout --detach FETCH_HEAD \
  && test "$(git -C /src/vllm-kvcr rev-parse HEAD)" = "${KVCR_VLLM_REF}"
 WORKDIR /src/vllm-kvcr
-RUN mkdir -p /overlay \
+# The single DRAM tier (docs/single-dram-tier.md) is carried here as a patch on
+# that commit. It is inert unless a KVCR tier sets single_dram_tier.
+COPY integrations/vllm/single-dram-tier.patch /tmp/single-dram-tier.patch
+RUN git apply /tmp/single-dram-tier.patch \
+ && mkdir -p /overlay \
  && cp --parents \
       vllm/distributed/kv_events.py \
       vllm/distributed/kv_transfer/kv_connector/v1/offloading/events.py \
       vllm/v1/kv_offload/base.py \
+      vllm/v1/kv_offload/cpu/manager.py \
+      vllm/v1/kv_offload/cpu/shared_offload_region.py \
       vllm/v1/kv_offload/tiering/factory.py \
       vllm/v1/kv_offload/tiering/kvcr/__init__.py \
       vllm/v1/kv_offload/tiering/kvcr/manager.py \
+      vllm/v1/kv_offload/tiering/kvcr/shared_tier.py \
+      vllm/v1/kv_offload/tiering/spec.py \
       /overlay/
 
 # Pin a landed Dynamo revision with the versioned KV hint protocol and
@@ -76,7 +84,8 @@ RUN python3 -m pip install --no-cache-dir /opt/kvcr-src \
  && python3 -m pip install --no-cache-dir \
       "nvidia-nccl-cu13==${NCCL_VERSION}"
 
-# Overlay the six vLLM files fetched from the public KVCR integration commit.
+# Overlay the vLLM files fetched from the public KVCR integration commit, with
+# the single DRAM tier patch applied.
 # The quick start pins that commit and this base image as one validated
 # compatibility set.
 COPY --from=vllm-kvcr-source /overlay/vllm /tmp/kvcr-vllm-overlay/vllm
@@ -123,6 +132,11 @@ assert int(metadata.version("protobuf").split(".", 1)[0]) < 7
 assert "abandon_timeout_ms" in inspect.signature(
     manager.KVCRSecondaryTierManager.__init__
 ).parameters
+assert "single_dram_tier" in inspect.signature(
+    manager.KVCRSecondaryTierManager.__init__
+).parameters
+from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+assert hasattr(CPUOffloadingManager, "set_eviction_gate")
 assert "chunk_ids" in TransferJob.__dataclass_fields__
 assert OffloadPolicy.CHUNK_LEVEL.value == "chunk_level"
 assert KV_HINT_TRANSFER_CAPABILITY_KEY == "router_hint"
